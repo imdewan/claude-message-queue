@@ -1,0 +1,20 @@
+{
+  "name": "queue",
+  "displayName": "Claude Message Queue",
+  "description": "A durable, non-interrupting next-turn queue for Claude Code CLI and Desktop.",
+  "version": "0.1.1",
+  "author": {
+    "name": "Dewan Shakil",
+    "url": "https://github.com/imdewan"
+  },
+  "homepage": "https://github.com/imdewan/claude-message-queue",
+  "repository": "https://github.com/imdewan/claude-message-queue",
+  "license": "MIT",
+  "keywords": [
+    "queue",
+    "messages",
+    "workflow",
+    "desktop",
+    "cli"
+  ]
+}

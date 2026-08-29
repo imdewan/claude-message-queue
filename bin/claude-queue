@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+VERSION="0.1.1"
+umask 077
+
+die() {
+  printf 'claude-queue: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+claude-queue - durable next-turn messages for Claude Code
+
+Usage:
+  claude-queue [--project DIR] [--state-dir DIR] <command> [arguments]
+
+Commands:
+  add MESSAGE...       Add a message to the end of the queue
+  add --stdin          Read a message from standard input
+  list                 List pending and active messages
+  count                Print the number of pending messages
+  peek                 Print the oldest pending message without claiming it
+  claim                Move the oldest pending message to active; print its ID
+  show ID              Print a pending or active message
+  done ID              Complete and remove an active message
+  retry ID             Move an active message back to pending
+  remove ID            Remove a pending or active message
+  clear --yes          Remove every pending and active message
+  path                 Print this project's queue directory
+  doctor               Check queue identity, storage, and dependencies
+  help                 Show this help
+
+Environment:
+  CLAUDE_PROJECT_DIR       Default project directory
+  CLAUDE_QUEUE_STATE_DIR   Override the queue state root (useful for tests)
+  XDG_STATE_HOME           Standard state root fallback
+
+Messages are scoped to the Git common directory, so normal checkouts and
+worktrees for the same local repository share a queue. Non-Git directories are
+scoped by their canonical path.
+EOF
+}
+
+project_input="${CLAUDE_PROJECT_DIR:-$PWD}"
+state_root="${CLAUDE_QUEUE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-message-queue}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --project)
+      [[ $# -ge 2 ]] || die "--project requires a directory"
+      project_input="$2"
+      shift 2
+      ;;
+    --state-dir)
+      [[ $# -ge 2 ]] || die "--state-dir requires a directory"
+      state_root="$2"
+      shift 2
+      ;;
+    --version|-V)
+      printf '%s\n' "$VERSION"
+      exit 0
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -* )
+      die "unknown global option: $1"
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+command_name="${1:-help}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+if [[ "$command_name" == "help" ]]; then
+  usage
+  exit 0
+fi
+
+[[ -d "$project_input" ]] || die "project directory does not exist: $project_input"
+project_path="$(cd "$project_input" && pwd -P)"
+
+git_common_dir=""
+git_root=""
+if command -v git >/dev/null 2>&1 && git -C "$project_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git_root="$(git -C "$project_path" rev-parse --show-toplevel)"
+  if git_common_dir="$(git -C "$project_path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    :
+  else
+    git_common_dir="$(git -C "$project_path" rev-parse --git-common-dir)"
+    case "$git_common_dir" in
+      /*) ;;
+      *) git_common_dir="$(cd "$git_root/$git_common_dir" && pwd -P)" ;;
+    esac
+  fi
+  queue_identity="git:$git_common_dir"
+  project_label="$git_root"
+else
+  queue_identity="dir:$project_path"
+  project_label="$project_path"
+fi
+
+hash_identity() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | awk '{print substr($1, 1, 24)}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | awk '{print substr($1, 1, 24)}'
+  elif command -v cksum >/dev/null 2>&1; then
+    printf '%s' "$1" | cksum | awk '{print $1 "-" $2}'
+  else
+    die "need shasum, sha256sum, or cksum to identify the project"
+  fi
+}
+
+project_key="$(hash_identity "$queue_identity")"
+queue_dir="$state_root/queues/$project_key"
+pending_dir="$queue_dir/pending"
+active_dir="$queue_dir/active"
+lock_dir="$queue_dir/.lock"
+
+ensure_state() {
+  mkdir -p "$pending_dir" "$active_dir"
+  if [[ ! -f "$queue_dir/project" ]]; then
+    printf '%s\n' "$project_label" > "$queue_dir/project"
+  fi
+}
+
+locked=0
+release_lock() {
+  if [[ "$locked" -eq 1 ]]; then
+    rm -f "$lock_dir/pid"
+    rmdir "$lock_dir" 2>/dev/null || true
+    locked=0
+  fi
+}
+
+acquire_lock() {
+  local attempt
+  local owner_pid
+  ensure_state
+  for ((attempt = 0; attempt < 200; attempt += 1)); do
+    if mkdir "$lock_dir" 2>/dev/null; then
+      printf '%s\n' "$$" > "$lock_dir/pid"
+      locked=1
+      trap release_lock EXIT INT TERM
+      return 0
+    fi
+    if [[ -f "$lock_dir/pid" ]]; then
+      owner_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+      if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+        rm -f "$lock_dir/pid"
+        rmdir "$lock_dir" 2>/dev/null || true
+      fi
+    fi
+    sleep 0.05
+  done
+  die "timed out waiting for the queue lock: $lock_dir"
+}
+
+finish_lock() {
+  release_lock
+  trap - EXIT INT TERM
+}
+
+oldest_message() {
+  local directory="$1"
+  find "$directory" -type f -name '*.msg' -print 2>/dev/null | LC_ALL=C sort | sed -n '1p'
+}
+
+message_count() {
+  local directory="$1"
+  find "$directory" -type f -name '*.msg' -print 2>/dev/null | wc -l | tr -d '[:space:]'
+}
+
+validate_id() {
+  [[ "$1" =~ ^q-[0-9]{20}-[0-9]{8}T[0-9]{6}Z$ ]] || die "invalid message ID: $1"
+}
+
+locate_message() {
+  local id="$1"
+  validate_id "$id"
+  if [[ -f "$pending_dir/$id.msg" ]]; then
+    printf '%s\n' "$pending_dir/$id.msg"
+  elif [[ -f "$active_dir/$id.msg" ]]; then
+    printf '%s\n' "$active_dir/$id.msg"
+  else
+    return 1
+  fi
+}
+
+print_preview() {
+  local file="$1"
+  tr '\n\r\t' '   ' < "$file" | cut -c 1-88
+}
+
+ensure_state
+
+case "$command_name" in
+  add)
+    input_tmp="$queue_dir/.message.$$.$RANDOM.tmp"
+    if [[ "${1:-}" == "--stdin" ]]; then
+      shift
+      [[ $# -eq 0 ]] || die "add --stdin does not accept more arguments"
+      cat > "$input_tmp"
+    else
+      if [[ "${1:-}" == "--" ]]; then
+        shift
+      fi
+      [[ $# -gt 0 ]] || die "add requires a message or --stdin"
+      printf '%s\n' "$*" > "$input_tmp"
+    fi
+    if [[ ! -s "$input_tmp" ]]; then
+      rm -f "$input_tmp"
+      die "message cannot be empty"
+    fi
+
+    acquire_lock
+    sequence_file="$queue_dir/sequence"
+    current_sequence="0"
+    if [[ -f "$sequence_file" ]]; then
+      current_sequence="$(cat "$sequence_file")"
+      [[ "$current_sequence" =~ ^[0-9]+$ ]] || die "invalid queue sequence: $sequence_file"
+    fi
+    next_sequence=$((current_sequence + 1))
+    sequence_tmp="$queue_dir/.sequence.$$.$RANDOM.tmp"
+    printf '%s\n' "$next_sequence" > "$sequence_tmp"
+    mv "$sequence_tmp" "$sequence_file"
+    message_id="q-$(printf '%020d' "$next_sequence")-$(date -u +%Y%m%dT%H%M%SZ)"
+    mv "$input_tmp" "$pending_dir/$message_id.msg"
+    finish_lock
+    printf '%s\n' "$message_id"
+    ;;
+
+  list)
+    pending_count="$(message_count "$pending_dir")"
+    active_count="$(message_count "$active_dir")"
+    printf 'Queue: %s\nPending: %s  Active: %s\n' "$project_label" "$pending_count" "$active_count"
+    for status_dir in "$active_dir" "$pending_dir"; do
+      status="$(basename "$status_dir")"
+      find "$status_dir" -type f -name '*.msg' -print 2>/dev/null | LC_ALL=C sort | while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        id="$(basename "$file" .msg)"
+        preview="$(print_preview "$file")"
+        printf '%-7s %s  %s\n' "$status" "$id" "$preview"
+      done
+    done
+    ;;
+
+  count)
+    printf '%s\n' "$(message_count "$pending_dir")"
+    ;;
+
+  peek)
+    file="$(oldest_message "$pending_dir")"
+    [[ -n "$file" ]] || exit 0
+    cat "$file"
+    ;;
+
+  claim)
+    acquire_lock
+    file="$(oldest_message "$pending_dir")"
+    if [[ -z "$file" ]]; then
+      finish_lock
+      exit 0
+    fi
+    message_id="$(basename "$file" .msg)"
+    mv "$file" "$active_dir/$message_id.msg"
+    finish_lock
+    printf '%s\n' "$message_id"
+    ;;
+
+  show)
+    [[ $# -eq 1 ]] || die "show requires one message ID"
+    file="$(locate_message "$1")" || die "message not found: $1"
+    cat "$file"
+    ;;
+
+  done)
+    [[ $# -eq 1 ]] || die "done requires one message ID"
+    validate_id "$1"
+    acquire_lock
+    [[ -f "$active_dir/$1.msg" ]] || die "active message not found: $1"
+    rm -f "$active_dir/$1.msg"
+    finish_lock
+    printf 'completed %s\n' "$1"
+    ;;
+
+  retry)
+    [[ $# -eq 1 ]] || die "retry requires one message ID"
+    validate_id "$1"
+    acquire_lock
+    [[ -f "$active_dir/$1.msg" ]] || die "active message not found: $1"
+    mv "$active_dir/$1.msg" "$pending_dir/$1.msg"
+    finish_lock
+    printf 'requeued %s\n' "$1"
+    ;;
+
+  remove)
+    [[ $# -eq 1 ]] || die "remove requires one message ID"
+    validate_id "$1"
+    acquire_lock
+    if [[ -f "$pending_dir/$1.msg" ]]; then
+      rm -f "$pending_dir/$1.msg"
+    elif [[ -f "$active_dir/$1.msg" ]]; then
+      rm -f "$active_dir/$1.msg"
+    else
+      die "message not found: $1"
+    fi
+    finish_lock
+    printf 'removed %s\n' "$1"
+    ;;
+
+  clear)
+    [[ "${1:-}" == "--yes" && $# -eq 1 ]] || die "clear is destructive; confirm with: clear --yes"
+    acquire_lock
+    removed=0
+    for file in "$pending_dir"/*.msg "$active_dir"/*.msg; do
+      [[ -e "$file" ]] || continue
+      rm -f "$file"
+      removed=$((removed + 1))
+    done
+    finish_lock
+    printf 'cleared %s message(s)\n' "$removed"
+    ;;
+
+  path)
+    printf '%s\n' "$queue_dir"
+    ;;
+
+  doctor)
+    printf 'claude-queue %s\n' "$VERSION"
+    printf 'Project: %s\n' "$project_label"
+    printf 'Identity: %s\n' "$queue_identity"
+    printf 'Queue: %s\n' "$queue_dir"
+    printf 'Pending: %s\n' "$(message_count "$pending_dir")"
+    printf 'Active: %s\n' "$(message_count "$active_dir")"
+    [[ -w "$queue_dir" ]] || die "queue directory is not writable"
+    printf 'Status: OK\n'
+    ;;
+
+  *)
+    die "unknown command: $command_name (run 'claude-queue help')"
+    ;;
+esac
