@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/imdewan/claude-message-queue/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/imdewan/claude-message-queue/test.yml?branch=main&style=flat-square&label=tests" alt="Test status" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-2f343b?style=flat-square" alt="MIT license" /></a>
-  <img src="https://img.shields.io/badge/plugin-v0.1.1-c96f4a?style=flat-square" alt="Plugin version 0.1.1" />
+  <img src="https://img.shields.io/badge/plugin-v0.2.0-c96f4a?style=flat-square" alt="Plugin version 0.2.0" />
   <img src="https://img.shields.io/badge/Claude%20Code-2.1.206%2B-c96f4a?style=flat-square" alt="Claude Code 2.1.206 or newer" />
 </p>
 
@@ -55,21 +55,28 @@ session or run `/reload-plugins` if Claude asks you to reload.
 /queue:add Run the full test suite and fix any failures
 ```
 
-### 3. Inspect and run it
+### 3. It runs by itself
+
+The moment the current work finishes, the plugin's `Stop` hook notices the
+pending message and Claude processes it in the same session — no extra command
+needed. If Claude was idle, the message runs right away. Inspect or drain
+manually whenever you want:
 
 ```text
 /queue:list
 /queue:run
 ```
 
-That is the complete workflow. The item remains pending until `/queue:run`
-claims it, and it is removed only after the queued request succeeds.
+An item is removed only after the queued request succeeds; failed items return
+to `pending`.
 
 ## Why use it?
 
 | Capability | What it gives you |
 | --- | --- |
 | Non-interrupting | Current work always finishes before queued work begins. |
+| Auto-run | A `Stop` hook drains the queue as soon as the turn ends — immediately if idle. |
+| Session-scoped | Only the session that queued a message picks it up; other sessions never do. |
 | Durable FIFO | Messages survive Claude restarts and execute in order. |
 | Safe lifecycle | Each item moves through `pending → active → done`. |
 | Failure recovery | Failed or blocked items return to `pending` instead of disappearing. |
@@ -94,6 +101,13 @@ Queue identity is based on the repository's Git common directory. This means a
 main checkout and its local worktrees share the same backlog, while unrelated
 clones and non-Git directories remain isolated.
 
+Within a project, each Claude session (CLI or Desktop) gets its own queue, so
+two sessions on the same folder never steal each other's messages. Messages
+added from a plain terminal — where no session exists — go to a shared
+project queue that any session claims as a fallback after its own messages.
+When a turn ends, the plugin's `Stop` hook checks this session's queue and, if
+anything is pending, Claude continues straight into processing it.
+
 ## Commands
 
 Claude requires marketplace skills to use a namespace, so the extension exposes
@@ -101,7 +115,7 @@ the compact `/queue:*` command family.
 
 | Command | Purpose |
 | --- | --- |
-| `/queue:add <message>` | Append a durable message without executing it. |
+| `/queue:add <message>` | Append a durable message; it auto-runs when current work ends. |
 | `/queue:list` | Show pending and active messages. |
 | `/queue:list peek` | Preview the oldest pending message. |
 | `/queue:list <id>` | Show a specific pending or active message. |
@@ -147,8 +161,9 @@ claude-queue done "$id"
 ```
 
 This is useful from Claude Desktop's integrated terminal: add an item while a
-turn is running without touching the active conversation, then invoke
-`/queue:run` later.
+turn is running without touching the active conversation. Terminal adds land
+in the project's shared queue, and the session drains them automatically when
+its current turn ends (or with `/queue:run`).
 
 <details>
 <summary><strong>Complete shell command reference</strong></summary>
@@ -170,7 +185,8 @@ claude-queue doctor
 ```
 
 Use `--project DIR` to address another project and `--state-dir DIR` to use an
-isolated state root.
+isolated state root. Use `--shared` (or `CLAUDE_QUEUE_SESSION=`) inside a
+session to address the project's shared queue instead of the session queue.
 
 </details>
 
@@ -215,8 +231,15 @@ export CLAUDE_QUEUE_STATE_DIR=/path/to/private/state
 
 ## Design choices
 
-- **No monitors:** Claude plugin monitors currently run only in interactive CLI
-  sessions, so depending on one would break Desktop parity.
+- **Stop hook, not monitors:** the queue drains via a standard `Stop` hook,
+  which fires identically in Claude Code CLI and the Desktop Code tab. The
+  hook blocks a finishing turn at most once (`stop_hook_active` guard), so a
+  failing message can never loop forever.
+- **Session scoping via environment:** inside a session both the skill's shell
+  commands and the hook see the same session ID (`CLAUDE_SESSION_ID` in the
+  CLI, `CLAUDE_CODE_HOST_SESSION_ID` in Desktop), so they always address the
+  same queue. Without a session ID everything falls back to the shared
+  project queue — the pre-0.2.0 behavior.
 - **No channels:** channels inject events into a running session, which conflicts
   with the promise that queued work waits.
 - **No personal skill install:** marketplace plugins remain portable and
@@ -260,6 +283,7 @@ CI runs on both macOS and Ubuntu.
 ├── .claude-plugin/   # Plugin and marketplace manifests
 ├── assets/           # README artwork
 ├── bin/              # Standalone queue executable
+├── hooks/            # Stop hook that auto-runs the queue after each turn
 ├── scripts/          # Install and validation helpers
 ├── skills/           # /queue:add, list, manage, and run
 └── tests/            # Lifecycle and concurrency tests
@@ -283,6 +307,16 @@ Open `/plugin`, verify `queue@imdewan-claude-tools` is enabled, then run
 Use <kbd>Enter</kbd> to queue another composer message. <kbd>Esc</kbd> explicitly
 stops the current response. Update Claude Code and Claude Desktop if mid-turn
 messages are being dropped.
+
+</details>
+
+<details>
+<summary><strong>Queued messages do not run automatically</strong></summary>
+
+The `Stop` hook is registered when a session starts. After installing or
+updating the plugin, start a new session (or run `/reload-plugins`) so the
+hook loads, and approve it if Claude asks for hook permission. `/queue:run`
+always works as a manual fallback.
 
 </details>
 

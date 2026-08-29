@@ -5,9 +5,10 @@ argument-hint: "[count|all]"
 disable-model-invocation: true
 ---
 
-Process durable queued messages for the current project in FIFO order. This
-skill starts only as its own turn. Never interrupt, cancel, or redirect work that
-is already running to invoke it.
+Process durable queued messages for the current session in FIFO order. This is
+the manual drain — queued messages normally run automatically via the plugin's
+Stop hook when a turn ends. This skill starts only as its own turn. Never
+interrupt, cancel, or redirect work that is already running to invoke it.
 
 `$ARGUMENTS` is either empty (run one message), a positive integer from 1 to 25,
 or `all` (run up to 25). Reject other values.

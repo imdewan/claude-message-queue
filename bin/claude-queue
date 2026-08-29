@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-VERSION="0.1.1"
+VERSION="0.2.0"
 umask 077
 
 die() {
@@ -15,7 +15,7 @@ usage() {
 claude-queue - durable next-turn messages for Claude Code
 
 Usage:
-  claude-queue [--project DIR] [--state-dir DIR] <command> [arguments]
+  claude-queue [--project DIR] [--state-dir DIR] [--shared] <command> [arguments]
 
 Commands:
   add MESSAGE...       Add a message to the end of the queue
@@ -36,16 +36,26 @@ Commands:
 Environment:
   CLAUDE_PROJECT_DIR       Default project directory
   CLAUDE_QUEUE_STATE_DIR   Override the queue state root (useful for tests)
+  CLAUDE_QUEUE_SESSION     Explicit session scope (set empty to force shared)
+  CLAUDE_SESSION_ID        Session scope inside Claude Code sessions
+  CLAUDE_CODE_HOST_SESSION_ID  Session scope inside Claude Desktop sessions
   XDG_STATE_HOME           Standard state root fallback
 
 Messages are scoped to the Git common directory, so normal checkouts and
 worktrees for the same local repository share a queue. Non-Git directories are
 scoped by their canonical path.
+
+Inside a Claude Code or Claude Desktop session the queue is additionally
+scoped to that session, so other sessions on the same project never pick up
+its messages. Messages added without a session (for example from a plain
+terminal, or with --shared) land in the project's shared queue, which every
+session can also read and claim as a fallback after its own messages.
 EOF
 }
 
 project_input="${CLAUDE_PROJECT_DIR:-$PWD}"
 state_root="${CLAUDE_QUEUE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-message-queue}"
+force_shared=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -58,6 +68,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die "--state-dir requires a directory"
       state_root="$2"
       shift 2
+      ;;
+    --shared)
+      force_shared=1
+      shift
       ;;
     --version|-V)
       printf '%s\n' "$VERSION"
@@ -127,12 +141,43 @@ hash_identity() {
 
 project_key="$(hash_identity "$queue_identity")"
 queue_dir="$state_root/queues/$project_key"
-pending_dir="$queue_dir/pending"
-active_dir="$queue_dir/active"
+shared_pending_dir="$queue_dir/pending"
+shared_active_dir="$queue_dir/active"
 lock_dir="$queue_dir/.lock"
+sequence_file="$queue_dir/sequence"
+
+# Session scope: an explicit CLAUDE_QUEUE_SESSION wins even when empty, so
+# CLAUDE_QUEUE_SESSION= forces the shared project queue from inside a session.
+if [[ "$force_shared" -eq 1 ]]; then
+  session_scope=""
+elif [[ -n "${CLAUDE_QUEUE_SESSION+set}" ]]; then
+  session_scope="$CLAUDE_QUEUE_SESSION"
+else
+  session_scope="${CLAUDE_SESSION_ID:-${CLAUDE_CODE_HOST_SESSION_ID:-}}"
+fi
+
+if [[ -n "$session_scope" ]]; then
+  session_key="$(hash_identity "session:$session_scope")"
+  session_dir="$queue_dir/sessions/$session_key"
+  pending_dir="$session_dir/pending"
+  active_dir="$session_dir/active"
+  read_pending_dirs=("$pending_dir" "$shared_pending_dir")
+  read_active_dirs=("$active_dir" "$shared_active_dir")
+  scope_label="session ($session_scope) + shared"
+else
+  session_dir=""
+  pending_dir="$shared_pending_dir"
+  active_dir="$shared_active_dir"
+  read_pending_dirs=("$pending_dir")
+  read_active_dirs=("$active_dir")
+  scope_label="shared"
+fi
 
 ensure_state() {
-  mkdir -p "$pending_dir" "$active_dir"
+  mkdir -p "$shared_pending_dir" "$shared_active_dir"
+  if [[ -n "$session_dir" ]]; then
+    mkdir -p "$pending_dir" "$active_dir"
+  fi
   if [[ ! -f "$queue_dir/project" ]]; then
     printf '%s\n' "$project_label" > "$queue_dir/project"
   fi
@@ -175,14 +220,15 @@ finish_lock() {
   trap - EXIT INT TERM
 }
 
+# Message IDs are monotonic across the whole project (one shared sequence), so
+# sorting by file name keeps FIFO order across the session and shared queues.
 oldest_message() {
-  local directory="$1"
-  find "$directory" -type f -name '*.msg' -print 2>/dev/null | LC_ALL=C sort | sed -n '1p'
+  find "$@" -type f -name '*.msg' -print 2>/dev/null \
+    | awk -F/ '{print $NF "\t" $0}' | LC_ALL=C sort | sed -n '1p' | cut -f2-
 }
 
 message_count() {
-  local directory="$1"
-  find "$directory" -type f -name '*.msg' -print 2>/dev/null | wc -l | tr -d '[:space:]'
+  find "$@" -type f -name '*.msg' -print 2>/dev/null | wc -l | tr -d '[:space:]'
 }
 
 validate_id() {
@@ -191,14 +237,28 @@ validate_id() {
 
 locate_message() {
   local id="$1"
+  local dir
   validate_id "$id"
-  if [[ -f "$pending_dir/$id.msg" ]]; then
-    printf '%s\n' "$pending_dir/$id.msg"
-  elif [[ -f "$active_dir/$id.msg" ]]; then
-    printf '%s\n' "$active_dir/$id.msg"
-  else
-    return 1
-  fi
+  for dir in "${read_pending_dirs[@]}" "${read_active_dirs[@]}"; do
+    if [[ -f "$dir/$id.msg" ]]; then
+      printf '%s\n' "$dir/$id.msg"
+      return 0
+    fi
+  done
+  return 1
+}
+
+locate_active() {
+  local id="$1"
+  local dir
+  validate_id "$id"
+  for dir in "${read_active_dirs[@]}"; do
+    if [[ -f "$dir/$id.msg" ]]; then
+      printf '%s\n' "$dir/$id.msg"
+      return 0
+    fi
+  done
+  return 1
 }
 
 print_preview() {
@@ -228,7 +288,6 @@ case "$command_name" in
     fi
 
     acquire_lock
-    sequence_file="$queue_dir/sequence"
     current_sequence="0"
     if [[ -f "$sequence_file" ]]; then
       current_sequence="$(cat "$sequence_file")"
@@ -245,12 +304,17 @@ case "$command_name" in
     ;;
 
   list)
-    pending_count="$(message_count "$pending_dir")"
-    active_count="$(message_count "$active_dir")"
-    printf 'Queue: %s\nPending: %s  Active: %s\n' "$project_label" "$pending_count" "$active_count"
-    for status_dir in "$active_dir" "$pending_dir"; do
-      status="$(basename "$status_dir")"
-      find "$status_dir" -type f -name '*.msg' -print 2>/dev/null | LC_ALL=C sort | while IFS= read -r file; do
+    pending_count="$(message_count "${read_pending_dirs[@]}")"
+    active_count="$(message_count "${read_active_dirs[@]}")"
+    printf 'Queue: %s\nScope: %s\nPending: %s  Active: %s\n' "$project_label" "$scope_label" "$pending_count" "$active_count"
+    for status in active pending; do
+      if [[ "$status" == "active" ]]; then
+        status_dirs=("${read_active_dirs[@]}")
+      else
+        status_dirs=("${read_pending_dirs[@]}")
+      fi
+      find "${status_dirs[@]}" -type f -name '*.msg' -print 2>/dev/null \
+        | awk -F/ '{print $NF "\t" $0}' | LC_ALL=C sort | cut -f2- | while IFS= read -r file; do
         [[ -n "$file" ]] || continue
         id="$(basename "$file" .msg)"
         preview="$(print_preview "$file")"
@@ -260,18 +324,18 @@ case "$command_name" in
     ;;
 
   count)
-    printf '%s\n' "$(message_count "$pending_dir")"
+    printf '%s\n' "$(message_count "${read_pending_dirs[@]}")"
     ;;
 
   peek)
-    file="$(oldest_message "$pending_dir")"
+    file="$(oldest_message "${read_pending_dirs[@]}")"
     [[ -n "$file" ]] || exit 0
     cat "$file"
     ;;
 
   claim)
     acquire_lock
-    file="$(oldest_message "$pending_dir")"
+    file="$(oldest_message "${read_pending_dirs[@]}")"
     if [[ -z "$file" ]]; then
       finish_lock
       exit 0
@@ -290,35 +354,27 @@ case "$command_name" in
 
   done)
     [[ $# -eq 1 ]] || die "done requires one message ID"
-    validate_id "$1"
     acquire_lock
-    [[ -f "$active_dir/$1.msg" ]] || die "active message not found: $1"
-    rm -f "$active_dir/$1.msg"
+    file="$(locate_active "$1")" || { finish_lock; die "active message not found: $1"; }
+    rm -f "$file"
     finish_lock
     printf 'completed %s\n' "$1"
     ;;
 
   retry)
     [[ $# -eq 1 ]] || die "retry requires one message ID"
-    validate_id "$1"
     acquire_lock
-    [[ -f "$active_dir/$1.msg" ]] || die "active message not found: $1"
-    mv "$active_dir/$1.msg" "$pending_dir/$1.msg"
+    file="$(locate_active "$1")" || { finish_lock; die "active message not found: $1"; }
+    mv "$file" "$pending_dir/$1.msg"
     finish_lock
     printf 'requeued %s\n' "$1"
     ;;
 
   remove)
     [[ $# -eq 1 ]] || die "remove requires one message ID"
-    validate_id "$1"
     acquire_lock
-    if [[ -f "$pending_dir/$1.msg" ]]; then
-      rm -f "$pending_dir/$1.msg"
-    elif [[ -f "$active_dir/$1.msg" ]]; then
-      rm -f "$active_dir/$1.msg"
-    else
-      die "message not found: $1"
-    fi
+    file="$(locate_message "$1")" || { finish_lock; die "message not found: $1"; }
+    rm -f "$file"
     finish_lock
     printf 'removed %s\n' "$1"
     ;;
@@ -327,10 +383,12 @@ case "$command_name" in
     [[ "${1:-}" == "--yes" && $# -eq 1 ]] || die "clear is destructive; confirm with: clear --yes"
     acquire_lock
     removed=0
-    for file in "$pending_dir"/*.msg "$active_dir"/*.msg; do
-      [[ -e "$file" ]] || continue
-      rm -f "$file"
-      removed=$((removed + 1))
+    for dir in "${read_pending_dirs[@]}" "${read_active_dirs[@]}"; do
+      for file in "$dir"/*.msg; do
+        [[ -e "$file" ]] || continue
+        rm -f "$file"
+        removed=$((removed + 1))
+      done
     done
     finish_lock
     printf 'cleared %s message(s)\n' "$removed"
@@ -344,9 +402,10 @@ case "$command_name" in
     printf 'claude-queue %s\n' "$VERSION"
     printf 'Project: %s\n' "$project_label"
     printf 'Identity: %s\n' "$queue_identity"
+    printf 'Scope: %s\n' "$scope_label"
     printf 'Queue: %s\n' "$queue_dir"
-    printf 'Pending: %s\n' "$(message_count "$pending_dir")"
-    printf 'Active: %s\n' "$(message_count "$active_dir")"
+    printf 'Pending: %s\n' "$(message_count "${read_pending_dirs[@]}")"
+    printf 'Active: %s\n' "$(message_count "${read_active_dirs[@]}")"
     [[ -w "$queue_dir" ]] || die "queue directory is not writable"
     printf 'Status: OK\n'
     ;;

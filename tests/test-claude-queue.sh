@@ -30,6 +30,9 @@ assert_contains() {
   [[ "$haystack" == *"$needle"* ]] || fail "$label (missing '$needle')"
 }
 
+# The host environment may be a Claude session; tests control scoping explicitly.
+unset CLAUDE_QUEUE_SESSION CLAUDE_SESSION_ID CLAUDE_CODE_HOST_SESSION_ID CLAUDE_PROJECT_DIR
+
 export CLAUDE_QUEUE_STATE_DIR="$test_root/state"
 main_repo="$test_root/project"
 worktree="$test_root/worktree"
@@ -97,4 +100,36 @@ fi
 
 assert_contains "$($queue --project "$main_repo" doctor)" "Status: OK" "doctor succeeds"
 
-printf 'PASS: lifecycle, FIFO, concurrency, stale-lock recovery, and worktree sharing\n'
+# Session scoping: each session has its own queue plus the shared fallback.
+session_a_id="$(CLAUDE_SESSION_ID='sess-a' "$queue" --project "$main_repo" add -- 'session A task')"
+shared_id="$("$queue" --project "$main_repo" add -- 'shared terminal task')"
+
+assert_eq "2" "$(CLAUDE_SESSION_ID='sess-a' "$queue" --project "$main_repo" count)" "session sees its own plus shared messages"
+assert_eq "1" "$(CLAUDE_SESSION_ID='sess-b' "$queue" --project "$main_repo" count)" "other sessions see only shared messages"
+assert_eq "1" "$("$queue" --project "$main_repo" count)" "terminal scope sees only the shared queue"
+assert_eq "1" "$(CLAUDE_SESSION_ID='sess-a' "$queue" --project "$main_repo" --shared count)" "--shared forces the shared queue"
+assert_eq "1" "$(CLAUDE_SESSION_ID='sess-a' CLAUDE_QUEUE_SESSION='' "$queue" --project "$main_repo" count)" "empty CLAUDE_QUEUE_SESSION forces the shared queue"
+assert_contains "$(CLAUDE_CODE_HOST_SESSION_ID='sess-a' "$queue" --project "$main_repo" doctor)" "session (sess-a)" "Desktop host session ID scopes the queue"
+
+first_claim="$(CLAUDE_SESSION_ID='sess-a' "$queue" --project "$main_repo" claim)"
+assert_eq "$session_a_id" "$first_claim" "session messages claim before shared ones"
+CLAUDE_SESSION_ID='sess-a' "$queue" --project "$main_repo" done "$first_claim" >/dev/null
+second_claim="$(CLAUDE_SESSION_ID='sess-a' "$queue" --project "$main_repo" claim)"
+assert_eq "$shared_id" "$second_claim" "shared messages are claimed as fallback"
+CLAUDE_SESSION_ID='sess-a' "$queue" --project "$main_repo" retry "$second_claim" >/dev/null
+assert_eq "1" "$(CLAUDE_SESSION_ID='sess-a' "$queue" --project "$main_repo" count)" "retried message stays pending"
+CLAUDE_SESSION_ID='sess-a' "$queue" --project "$main_repo" remove "$second_claim" >/dev/null
+assert_eq "0" "$(CLAUDE_SESSION_ID='sess-b' "$queue" --project "$main_repo" count)" "session queues drain independently"
+
+# Stop hook: blocks only when messages are pending and not already continuing.
+stop_hook="$repo_dir/hooks/stop-drain.sh"
+hook_env=(env CLAUDE_PROJECT_DIR="$main_repo" CLAUDE_SESSION_ID='sess-hook')
+assert_eq "" "$(printf '{"session_id":"x","stop_hook_active":false}' | "${hook_env[@]}" "$stop_hook")" "empty queue lets the turn stop"
+hook_msg_id="$(CLAUDE_SESSION_ID='sess-hook' "$queue" --project "$main_repo" add -- 'hook task')"
+hook_output="$(printf '{"session_id":"x","stop_hook_active":false}' | "${hook_env[@]}" "$stop_hook")"
+assert_contains "$hook_output" '"decision":"block"' "pending messages block the stop"
+assert_contains "$hook_output" '1 pending message' "hook reports the pending count"
+assert_eq "" "$(printf '{"session_id":"x","stop_hook_active":true}' | "${hook_env[@]}" "$stop_hook")" "stop_hook_active prevents drain loops"
+CLAUDE_SESSION_ID='sess-hook' "$queue" --project "$main_repo" remove "$hook_msg_id" >/dev/null
+
+printf 'PASS: lifecycle, FIFO, concurrency, stale-lock recovery, worktree sharing, session scoping, and stop hook\n'
