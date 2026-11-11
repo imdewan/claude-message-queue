@@ -254,6 +254,45 @@ export CLAUDE_QUEUE_STATE_DIR=/path/to/private/state
 - `git` is optional. Non-Git folders are scoped by canonical directory path.
 - One of `shasum`, `sha256sum`, or `cksum` for project identity hashing.
 
+## Nix
+
+The repository is a flake. The package installs `claude-queue` with its
+runtime tools on `PATH`, and the plugin tree under
+`share/claude-message-queue`.
+
+Add it to another flake's dev shell:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    claude-message-queue.url = "github:imdewan/claude-message-queue";
+    claude-message-queue.inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  outputs = { nixpkgs, claude-message-queue, ... }:
+    let
+      system = "x86_64-linux";
+      pkgs = nixpkgs.legacyPackages.${system};
+    in {
+      devShells.${system}.default = pkgs.mkShell {
+        packages = [ claude-message-queue.packages.${system}.default ];
+      };
+    };
+}
+```
+
+An overlay is also exported as `overlays.default`; it adds
+`pkgs.claude-message-queue`. To load the packaged plugin directly:
+
+```bash
+claude --plugin-dir "$(nix build --print-out-paths --no-link github:imdewan/claude-message-queue)/share/claude-message-queue"
+```
+
+Other outputs: `nix run` runs `claude-queue`; `nix flake check` builds the
+package and runs the test suite; `nix develop` opens a shell for working on
+the project.
+
 ## Development
 
 Clone the project and run the complete check:
